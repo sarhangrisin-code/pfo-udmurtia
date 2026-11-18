@@ -1,0 +1,92 @@
+name: Publish to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: github-pages-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare static files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s index.html
+          test -s styles.css
+          test -d images
+          test -s fonts/oswald-bold.woff2
+          test -s fonts/oswald-ofl.txt
+          test -z "$(find images fonts -type l -print -quit)"
+          out="$RUNNER_TEMP/pages-site"
+          mkdir "$out"
+          cp -R index.html styles.css images fonts "$out/"
+          printf '\n<!-- deployed-revision=%s -->\n' "$GITHUB_SHA" >> "$out/index.html"
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/pages-site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment
+
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Check the public homepage and all assets
+        shell: bash
+        env:
+          PAGE_URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          page="$RUNNER_TEMP/homepage.html"
+          download=(curl --fail --silent --show-error --location --max-time 15 --proto '=https' --proto-redir '=https')
+          for attempt in {1..20}; do
+            if "${download[@]}" --output "$page" "${PAGE_URL%/}/?revision=$GITHUB_SHA" &&
+                grep -Fq "<!-- deployed-revision=$GITHUB_SHA -->" "$page"; then
+              python3 - "$page" <<'PY' > "$RUNNER_TEMP/asset-list"
+          import re
+          import sys
+          from pathlib import Path
+          page = Path(sys.argv[1]).read_text(encoding="utf-8")
+          assert all(f'id="{section}"' in page for section in ("about", "history", "places", "nature", "culture", "facts", "sources"))
+          assets = sorted(set(re.findall(r'\./(?:styles\.css|fonts/oswald-bold\.woff2|images/[a-z0-9_-]+\.webp)', page)))
+          assert "./styles.css" in assets and any(name.startswith("./images/") for name in assets)
+          print("\n".join(assets))
+          PY
+              while IFS= read -r asset; do
+                "${download[@]}" --output "$RUNNER_TEMP/asset" "${PAGE_URL%/}/${asset#./}"
+                test -s "$RUNNER_TEMP/asset"
+              done < "$RUNNER_TEMP/asset-list"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::The public homepage did not serve the expected commit."
+          exit 1
